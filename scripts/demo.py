@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""End-to-end demo: seed segments, issue a report, then correct a control.
+"""End-to-end demo: seed segments, issue a report, then run consecutive corrections.
+
+The correction sequence demonstrates that each receipt reflects only its own
+operation: an in-window change marks the report pending_recalc, an
+out-of-window addition does not re-list it, and reverting the in-window value
+to the original still lists the report (which stays pending_recalc).
 
 Usage (service already running, e.g. via docker compose):
 
@@ -104,12 +109,12 @@ def main() -> int:
             json={"readings": [{"date": "2026-03-13", "kwh_per_lamp": 9.0}]},
         )
         corrected.raise_for_status()
-        _show("correction on control1", corrected.json())
+        _show("correction 1: control1 in-window 9.7 -> 9.0", corrected.json())
 
         detail = client.get(f"/api/reports/{report['id']}")
         detail.raise_for_status()
         after = detail.json()
-        _show("report after correction", after)
+        _show("report after correction 1", after)
         assert after["status"] == "pending_recalc", after["status"]
         assert after["net_savings_per_lamp_per_day"] == report[
             "net_savings_per_lamp_per_day"
@@ -119,6 +124,33 @@ def main() -> int:
             "\nOK: report is pending_recalc, original result still readable, "
             f"stale segment ids={after['stale_segment_ids']}"
         )
+
+        # Consecutive corrections: the receipt must reflect only each operation.
+        out_of_window = client.put(
+            f"/api/segments/{control1}/readings",
+            json={"readings": [{"date": "2026-04-01", "kwh_per_lamp": 3.3}]},
+        )
+        out_of_window.raise_for_status()
+        _show("correction 2: control1 out-of-window add 2026-04-01", out_of_window.json())
+        assert out_of_window.json()["affected_reports"] == [], out_of_window.json()
+        print("OK: out-of-window correction does not re-list the pending report")
+
+        reverted = client.put(
+            f"/api/segments/{control1}/readings",
+            json={"readings": [{"date": "2026-03-13", "kwh_per_lamp": 9.7}]},
+        )
+        reverted.raise_for_status()
+        _show("correction 3: control1 in-window back to original 9.7", reverted.json())
+        assert reverted.json()["affected_reports"] == [
+            {
+                "report_id": report["id"],
+                "previous_status": "pending_recalc",
+                "status": "pending_recalc",
+            }
+        ], reverted.json()
+        still = client.get(f"/api/reports/{report['id']}").json()
+        assert still["status"] == "pending_recalc", still["status"]
+        print("OK: reverting to the original value still lists the report; it stays pending_recalc")
 
         listing = client.get("/api/reports", params={"status": "pending_recalc"})
         listing.raise_for_status()

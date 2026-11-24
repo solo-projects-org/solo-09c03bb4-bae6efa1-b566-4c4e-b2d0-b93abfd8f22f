@@ -286,18 +286,12 @@ def test_correction_only_rereads_corrected_segment(client, monkeypatch):
 
     calls: list[int] = []
     original_for_dates = service._readings_for_dates
-    original_all = service._all_readings
 
     def spy_for_dates(conn, segment_id, dates):
         calls.append(segment_id)
         return original_for_dates(conn, segment_id, dates)
 
-    def spy_all(conn, segment_id):
-        calls.append(segment_id)
-        return original_all(conn, segment_id)
-
     monkeypatch.setattr(service, "_readings_for_dates", spy_for_dates)
-    monkeypatch.setattr(service, "_all_readings", spy_all)
 
     client.put(
         f"/api/segments/{ids['C1-对照']}/readings",
@@ -475,6 +469,143 @@ def test_reading_on_skipped_retrofit_day_does_not_affect_report(client):
     # The skipped day is never used by the comparison.
     assert result["affected_reports"] == []
     assert client.get(f"/api/reports/{report['id']}").json()["status"] == "issued"
+
+
+def test_out_of_window_correction_does_not_relist_stale_report(client):
+    """Once a report is pending, an out-of-window correction must not list it."""
+    ids = seed(client)
+    report = client.post("/api/reports", params={"segment_id": ids["T-目标"]}).json()["report"]
+    first = client.put(
+        f"/api/segments/{ids['C1-对照']}/readings",
+        json=_readings({"2026-03-13": 9.0}),
+    ).json()
+    assert [a["report_id"] for a in first["affected_reports"]] == [report["id"]]
+
+    second = client.put(
+        f"/api/segments/{ids['C1-对照']}/readings",
+        json=_readings({"2026-04-01": 3.3}),
+    ).json()
+    assert second["changed"] is True
+    assert second["affected_reports"] == []
+    assert second["impact"]["reports_reviewed"] == 0
+    assert second["impact"]["reports_already_pending"] == 0
+
+    detail = client.get(f"/api/reports/{report['id']}").json()
+    assert detail["status"] == "pending_recalc"
+    assert len(detail["stale_reasons"]) == 1
+
+
+def test_changing_reading_back_still_lists_stale_report(client):
+    """Reverting an in-window value to the snapshot value is still a change
+    inside the comparison window: the receipt must list the report, and the
+    report must stay pending_recalc (never silently restored)."""
+    ids = seed(client)
+    report = client.post("/api/reports", params={"segment_id": ids["T-目标"]}).json()["report"]
+    client.put(
+        f"/api/segments/{ids['C1-对照']}/readings",
+        json=_readings({"2026-03-13": 9.0}),
+    )
+
+    reverted = client.put(
+        f"/api/segments/{ids['C1-对照']}/readings",
+        json=_readings({"2026-03-13": 9.7}),  # back to the snapshot value
+    ).json()
+    assert reverted["changed"] is True
+    assert reverted["affected_reports"] == [
+        {
+            "report_id": report["id"],
+            "previous_status": "pending_recalc",
+            "status": "pending_recalc",
+        }
+    ]
+    assert reverted["impact"]["reports_already_pending"] == 1
+    assert reverted["impact"]["reports_marked_pending"] == 0
+
+    detail = client.get(f"/api/reports/{report['id']}").json()
+    assert detail["status"] == "pending_recalc"
+    # Snapshot and net savings are still the original ones.
+    assert detail["net_savings_per_lamp_per_day"] == pytest.approx(1.5)
+    assert detail["controls"] == report["controls"]
+
+
+def test_consecutive_in_window_corrections_accumulate_reasons(client):
+    ids = seed(client)
+    report = client.post("/api/reports", params={"segment_id": ids["T-目标"]}).json()["report"]
+    client.put(
+        f"/api/segments/{ids['C1-对照']}/readings",
+        json=_readings({"2026-03-13": 9.0}),
+    )
+    second = client.put(
+        f"/api/segments/{ids['C1-对照']}/readings",
+        json=_readings({"2026-03-14": 9.1}),
+    ).json()
+    assert second["affected_reports"] == [
+        {
+            "report_id": report["id"],
+            "previous_status": "pending_recalc",
+            "status": "pending_recalc",
+        }
+    ]
+    detail = client.get(f"/api/reports/{report['id']}").json()
+    assert detail["status"] == "pending_recalc"
+    assert [r["dates"] for r in detail["stale_reasons"]] == [
+        ["2026-03-13"],
+        ["2026-03-14"],
+    ]
+
+
+def test_control_dropout_after_becoming_eligible_is_marked(client):
+    """A segment that qualified via an earlier correction (so it is not in the
+    snapshot control list) must still be flagged when it drops out again."""
+    ids = seed(client)
+    report = client.post("/api/reports", params={"segment_id": ids["T-目标"]}).json()["report"]
+    values = {**_flat(BEFORE, 5.0), **_flat(AFTER, 4.5)}
+    added = client.put(
+        f"/api/segments/{ids['Y-无读数未换灯']}/readings", json=_readings(values)
+    ).json()
+    assert [a["report_id"] for a in added["affected_reports"]] == [report["id"]]
+
+    dropped = client.delete(
+        f"/api/segments/{ids['Y-无读数未换灯']}/readings/2026-03-15"
+    ).json()
+    assert dropped["affected_reports"] == [
+        {
+            "report_id": report["id"],
+            "previous_status": "pending_recalc",
+            "status": "pending_recalc",
+        }
+    ]
+    detail = client.get(f"/api/reports/{report['id']}").json()
+    assert detail["status"] == "pending_recalc"
+    assert [r["type"] for r in detail["stale_reasons"]] == [
+        "control_added",
+        "control_removed",
+    ]
+    assert detail["stale_reasons"][1]["reason"] == "readings_incomplete"
+
+
+def test_target_reading_reverted_still_lists_stale_report(client):
+    ids = seed(client)
+    report = client.post("/api/reports", params={"segment_id": ids["T-目标"]}).json()["report"]
+    client.put(
+        f"/api/segments/{ids['T-目标']}/readings",
+        json=_readings({"2026-03-15": 7.5}),
+    )
+    reverted = client.put(
+        f"/api/segments/{ids['T-目标']}/readings",
+        json=_readings({"2026-03-15": 8.0}),  # back to the snapshot value
+    ).json()
+    assert reverted["affected_reports"] == [
+        {
+            "report_id": report["id"],
+            "previous_status": "pending_recalc",
+            "status": "pending_recalc",
+        }
+    ]
+    detail = client.get(f"/api/reports/{report['id']}").json()
+    assert detail["status"] == "pending_recalc"
+    assert detail["stale_reasons"][-1]["type"] == "target_readings_changed"
+    assert detail["stale_reasons"][-1]["dates"] == ["2026-03-15"]
 
 
 def test_duplicate_dates_in_one_upsert_last_one_wins(client):

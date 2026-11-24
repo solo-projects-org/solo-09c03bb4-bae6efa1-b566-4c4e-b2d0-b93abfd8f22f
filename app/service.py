@@ -17,9 +17,13 @@ Design notes
   generation and corrections are serialised by SQLite.  A correction therefore
   either sees the new report and marks it, or commits before the report is
   snapshotted.  It can never fall between the snapshot read and the insert.
-* Correction impact is evaluated by re-reading only the corrected segment's
-  daily readings.  Other segments are never re-read; the report snapshot tells
-  us which of those readings the report actually used.
+* Correction impact reflects only the operation at hand.  A report is
+  reviewed only when this operation actually touches its stored comparison
+  window (target retrofit-date change, readings changed inside the window,
+  or a control-eligibility flip), and only the corrected segment's readings
+  are re-read -- just the dates those windows need.  Other segments are
+  never re-read.  Reports already ``pending_recalc`` are judged by the same
+  per-operation rule; changing a value back never restores ``issued``.
 """
 
 from __future__ import annotations
@@ -146,15 +150,6 @@ def _readings_for_dates(
     return {date.fromisoformat(r["reading_date"]): r["kwh_per_lamp"] for r in rows}
 
 
-def _all_readings(conn: sqlite3.Connection, segment_id: int) -> dict[date, float]:
-    rows = conn.execute(
-        "SELECT reading_date, kwh_per_lamp FROM readings WHERE segment_id = ? "
-        "ORDER BY reading_date",
-        (segment_id,),
-    ).fetchall()
-    return {date.fromisoformat(r["reading_date"]): r["kwh_per_lamp"] for r in rows}
-
-
 def _is_control_eligible(retrofit_date: date | None, after_end: date) -> bool:
     return retrofit_date is None or retrofit_date > after_end
 
@@ -232,7 +227,7 @@ def correct_retrofit_date(
                 changed=False,
                 old_retrofit_date=old_retrofit,
                 new_retrofit_date=new_retrofit,
-                impact=_impact_metrics(conn, segment_id, affected=[]),
+                impact=_impact_metrics(segment_id, affected=[], reviewed=0),
             ).model_dump()
 
         now = utcnow_iso()
@@ -241,7 +236,7 @@ def correct_retrofit_date(
             "WHERE id = ?",
             (new_retrofit.isoformat() if new_retrofit else None, now, segment_id),
         )
-        affected = _apply_correction_impact(
+        affected, reviewed = _apply_correction_impact(
             conn,
             segment_id=segment_id,
             segment_name=row["name"],
@@ -249,6 +244,8 @@ def correct_retrofit_date(
             old_retrofit=old_retrofit,
             new_retrofit=new_retrofit,
             changed_dates=[],
+            touched_dates=[],
+            old_values={},
         )
         return CorrectionResult(
             segment_id=segment_id,
@@ -256,7 +253,7 @@ def correct_retrofit_date(
             old_retrofit_date=old_retrofit,
             new_retrofit_date=new_retrofit,
             affected_reports=affected,
-            impact=_impact_metrics(conn, segment_id, affected),
+            impact=_impact_metrics(segment_id, affected, reviewed),
         ).model_dump()
 
 
@@ -270,16 +267,17 @@ def upsert_readings(
 
     with db.write() as conn:
         row = _get_segment_row(conn, segment_id)
-        old = _all_readings(conn, segment_id)
         # Later entries win for a duplicated date, matching the upsert order.
         latest: dict[date, float] = {}
         for reading_date, value in readings:
             latest[reading_date] = value
-        changed_dates: list[date] = []
-        now = utcnow_iso()
-        for reading_date, value in latest.items():
-            if reading_date not in old or old[reading_date] != value:
-                changed_dates.append(reading_date)
+        # Read only the touched dates of this segment to find real changes.
+        old_values = _readings_for_dates(conn, segment_id, latest.keys())
+        changed_dates: list[date] = sorted(
+            reading_date
+            for reading_date, value in latest.items()
+            if old_values.get(reading_date) != value
+        )
 
         if not changed_dates:
             return CorrectionResult(
@@ -295,9 +293,10 @@ def upsert_readings(
                     if row["retrofit_date"]
                     else None
                 ),
-                impact=_impact_metrics(conn, segment_id, affected=[]),
+                impact=_impact_metrics(segment_id, affected=[], reviewed=0),
             ).model_dump()
 
+        now = utcnow_iso()
         for reading_date, value in latest.items():
             conn.execute(
                 "INSERT INTO readings (segment_id, reading_date, kwh_per_lamp, updated_at) "
@@ -314,24 +313,25 @@ def upsert_readings(
         retrofit = (
             date.fromisoformat(row["retrofit_date"]) if row["retrofit_date"] else None
         )
-        changed_dates_sorted = sorted(set(changed_dates))
-        affected = _apply_correction_impact(
+        affected, reviewed = _apply_correction_impact(
             conn,
             segment_id=segment_id,
             segment_name=row["name"],
             retrofit_changed=False,
             old_retrofit=retrofit,
             new_retrofit=retrofit,
-            changed_dates=changed_dates_sorted,
+            changed_dates=changed_dates,
+            touched_dates=latest.keys(),
+            old_values=old_values,
         )
         return CorrectionResult(
             segment_id=segment_id,
             changed=True,
-            changed_readings=changed_dates_sorted,
+            changed_readings=changed_dates,
             old_retrofit_date=retrofit,
             new_retrofit_date=retrofit,
             affected_reports=affected,
-            impact=_impact_metrics(conn, segment_id, affected),
+            impact=_impact_metrics(segment_id, affected, reviewed),
         ).model_dump()
 
 
@@ -342,20 +342,20 @@ def delete_reading(
 
     with db.write() as conn:
         row = _get_segment_row(conn, segment_id)
-        exists = conn.execute(
-            "SELECT 1 FROM readings WHERE segment_id = ? AND reading_date = ?",
+        existing = conn.execute(
+            "SELECT kwh_per_lamp FROM readings WHERE segment_id = ? AND reading_date = ?",
             (segment_id, reading_date.isoformat()),
         ).fetchone()
         retrofit = (
             date.fromisoformat(row["retrofit_date"]) if row["retrofit_date"] else None
         )
-        if exists is None:
+        if existing is None:
             return CorrectionResult(
                 segment_id=segment_id,
                 changed=False,
                 old_retrofit_date=retrofit,
                 new_retrofit_date=retrofit,
-                impact=_impact_metrics(conn, segment_id, affected=[]),
+                impact=_impact_metrics(segment_id, affected=[], reviewed=0),
             ).model_dump()
 
         conn.execute(
@@ -366,7 +366,7 @@ def delete_reading(
             "UPDATE segments SET version = version + 1, updated_at = ? WHERE id = ?",
             (utcnow_iso(), segment_id),
         )
-        affected = _apply_correction_impact(
+        affected, reviewed = _apply_correction_impact(
             conn,
             segment_id=segment_id,
             segment_name=row["name"],
@@ -374,6 +374,8 @@ def delete_reading(
             old_retrofit=retrofit,
             new_retrofit=retrofit,
             changed_dates=[reading_date],
+            touched_dates=[reading_date],
+            old_values={reading_date: existing["kwh_per_lamp"]},
         )
         return CorrectionResult(
             segment_id=segment_id,
@@ -382,21 +384,20 @@ def delete_reading(
             old_retrofit_date=retrofit,
             new_retrofit_date=retrofit,
             affected_reports=affected,
-            impact=_impact_metrics(conn, segment_id, affected),
+            impact=_impact_metrics(segment_id, affected, reviewed),
         ).model_dump()
 
 
 def _impact_metrics(
-    conn: sqlite3.Connection, segment_id: int, affected: list[AffectedReport]
+    segment_id: int, affected: list[AffectedReport], reviewed: int
 ) -> dict:
-    total = conn.execute("SELECT COUNT(*) AS n FROM reports").fetchone()["n"]
     newly = sum(1 for a in affected if a.previous_status == "issued")
     already = len(affected) - newly
     return {
-        "reports_reviewed": total,
+        "reports_reviewed": reviewed,
         "reports_marked_pending": newly,
         "reports_already_pending": already,
-        "reports_unaffected": total - len(affected),
+        "reports_unaffected": reviewed - len(affected),
         "segments_reread": [segment_id],
     }
 
@@ -404,10 +405,6 @@ def _impact_metrics(
 # ---------------------------------------------------------------------------
 # Correction impact
 # ---------------------------------------------------------------------------
-
-
-def _snapshot_controls(snapshot: dict) -> list[dict]:
-    return snapshot.get("controls", [])
 
 
 def _apply_correction_impact(
@@ -419,28 +416,69 @@ def _apply_correction_impact(
     old_retrofit: date | None,
     new_retrofit: date | None,
     changed_dates: list[date],
-) -> list[AffectedReport]:
-    """Compare the corrected segment against report snapshots.
+    touched_dates: Iterable[date],
+    old_values: dict[date, float],
+) -> tuple[list[AffectedReport], int]:
+    """Mark the reports this correction impacts as ``pending_recalc``.
 
-    Reads only the corrected segment's readings.  Every impacted report is
-    marked ``pending_recalc`` inside the caller's write transaction.
+    The verdict reflects only *this* operation, never a snapshot-vs-current
+    diff:
+
+    * Only reports whose stored comparison window the operation actually
+      touches are reviewed, and only the corrected segment's readings are
+      re-read (just the dates those windows need).
+    * Target reports: a retrofit-date change, or readings this operation
+      changed inside the window.
+    * Other segments: control eligibility is compared immediately before
+      and after the operation -- newly qualifying, dropping out, or still
+      qualifying while its in-window readings changed.  The snapshot's
+      control list does not limit this judgement.
+    * Reports already ``pending_recalc`` are judged by the same rule; their
+      snapshot, first-stale timestamp and existing reasons are preserved,
+      and changing a value back never restores ``issued``.
+
+    Everything runs inside the caller's write transaction, so the data
+    change and the stale marking commit or roll back together.
+
+    Returns the affected reports and how many reports were reviewed.
     """
 
     reports = conn.execute("SELECT * FROM reports ORDER BY id").fetchall()
     if not reports:
-        return []
+        return [], 0
 
-    # Gather only the dates the reports actually use, then read this segment once.
-    needed: set[date] = set()
+    changed = set(changed_dates)
+    touched = set(touched_dates)
+
+    # Keep only the reports this operation can possibly affect.
+    candidates: list[tuple[sqlite3.Row, dict[str, date], list[date]]] = []
     for report in reports:
-        needed.update(window_dates(_window_from_row(report)))
+        window = _window_from_row(report)
+        dates = window_dates(window)
+        if report["target_segment_id"] == segment_id:
+            if retrofit_changed or not changed.isdisjoint(dates):
+                candidates.append((report, window, dates))
+        elif retrofit_changed:
+            # Only a control-eligibility flip can matter here.
+            if _is_control_eligible(
+                old_retrofit, window["after_end"]
+            ) != _is_control_eligible(new_retrofit, window["after_end"]):
+                candidates.append((report, window, dates))
+        elif not changed.isdisjoint(dates):
+            candidates.append((report, window, dates))
+
+    if not candidates:
+        return [], 0
+
+    # Re-read only the dates the reviewed reports actually use.
+    needed: set[date] = set()
+    for _, _, dates in candidates:
+        needed.update(dates)
     current = _readings_for_dates(conn, segment_id, needed)
 
     affected: list[AffectedReport] = []
-    for report in reports:
-        snapshot = json.loads(report["snapshot_json"])
-        window = _window_from_row(report)
-        dates = window_dates(window)
+    for report, window, dates in candidates:
+        in_window = sorted(changed.intersection(dates))
         reason: dict | None = None
 
         if report["target_segment_id"] == segment_id:
@@ -454,57 +492,47 @@ def _apply_correction_impact(
                     "old_window": _iso_window(window),
                 }
             else:
-                used = snapshot["target"]["readings"]
-                diffs = [
-                    d
-                    for d in dates
-                    if str(d) in used and used[str(d)] != current.get(d)
-                ]
-                if diffs:
-                    reason = {
-                        "type": "target_readings_changed",
-                        "segment_id": segment_id,
-                        "segment_name": segment_name,
-                        "dates": [d.isoformat() for d in diffs],
-                    }
+                reason = {
+                    "type": "target_readings_changed",
+                    "segment_id": segment_id,
+                    "segment_name": segment_name,
+                    "dates": [d.isoformat() for d in in_window],
+                }
         else:
-            controls = _snapshot_controls(snapshot)
-            control = next((c for c in controls if c["id"] == segment_id), None)
-            eligible = _is_control_eligible(new_retrofit, window["after_end"])
-            has_all = all(d in current for d in dates)
+            # Control eligibility immediately before vs. after this
+            # operation.  Dates it did not touch keep their current state.
+            has_all_before = all(
+                (d in old_values) if d in touched else (d in current) for d in dates
+            )
+            has_all_after = all(d in current for d in dates)
+            date_ok_before = _is_control_eligible(old_retrofit, window["after_end"])
+            date_ok_after = _is_control_eligible(new_retrofit, window["after_end"])
+            eligible_before = date_ok_before and has_all_before
+            eligible_after = date_ok_after and has_all_after
 
-            if control is not None:
-                if not eligible or not has_all:
-                    reason = {
-                        "type": "control_removed",
-                        "segment_id": segment_id,
-                        "segment_name": segment_name,
-                        "reason": (
-                            "retrofit_date_now_inside_window"
-                            if not eligible
-                            else "readings_incomplete"
-                        ),
-                    }
-                else:
-                    diffs = [
-                        d
-                        for d in dates
-                        if control["readings"].get(str(d)) != current.get(d)
-                    ]
-                    if diffs:
-                        reason = {
-                            "type": "control_readings_changed",
-                            "segment_id": segment_id,
-                            "segment_name": segment_name,
-                            "dates": [d.isoformat() for d in diffs],
-                        }
-            elif eligible and has_all:
-                # The segment was ineligible or incomplete when the report was
-                # issued and now qualifies, so the control list would change.
+            if not eligible_before and eligible_after:
                 reason = {
                     "type": "control_added",
                     "segment_id": segment_id,
                     "segment_name": segment_name,
+                }
+            elif eligible_before and not eligible_after:
+                reason = {
+                    "type": "control_removed",
+                    "segment_id": segment_id,
+                    "segment_name": segment_name,
+                    "reason": (
+                        "retrofit_date_now_inside_window"
+                        if not date_ok_after
+                        else "readings_incomplete"
+                    ),
+                }
+            elif eligible_before and eligible_after and in_window:
+                reason = {
+                    "type": "control_readings_changed",
+                    "segment_id": segment_id,
+                    "segment_name": segment_name,
+                    "dates": [d.isoformat() for d in in_window],
                 }
 
         if reason is None:
@@ -539,11 +567,7 @@ def _apply_correction_impact(
             )
         )
 
-    # Every diff above is derived from the snapshot vs. the re-read values, so
-    # stale marking relies only on this segment's readings, never on a
-    # caller-supplied change list and never on re-reading other segments.
-    _ = changed_dates
-    return affected
+    return affected, len(candidates)
 
 
 def _same_reason(left: dict, right: dict) -> bool:
